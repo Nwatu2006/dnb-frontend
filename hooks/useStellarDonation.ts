@@ -5,32 +5,96 @@ import { useStellar } from "@/components/stellar/StellarProvider";
 import { toast } from "sonner";
 import axiosInstance from "@/lib/config/axios.config";
 
+/** Envelope fields the donation API uses to signal success or failure. */
+interface DonationApiEnvelope {
+  success?: boolean;
+  message?: string;
+}
+
+/** Body returned by POST /api/stellar/donation/initialize. */
+export interface InitializeDonationApiResponse extends DonationApiEnvelope {
+  donationId: string;
+  transactionXdr: string;
+  networkPassphrase?: string;
+  [key: string]: unknown;
+}
+
 export interface InitializeDonationParams {
   amount: number | string;
 }
 
-export interface InitializeDonationResult {
-  donationId: string;
-  transactionXdr: string;
-  networkPassphrase?: string;
+/** Initialize response plus the requested amount, which the hook adds client-side. */
+export interface InitializeDonationResult extends InitializeDonationApiResponse {
   amount: number | string;
-  [key: string]: any; // TODO(types): Additional donation fields
 }
 
-export interface DonationStatsResult {
+/** Body returned by GET /api/stellar/donation/stats. */
+export interface DonationStatsResult extends DonationApiEnvelope {
   success: boolean;
   unconfigured?: boolean;
   message?: string;
-  [key: string]: any; // TODO(types): Donation stats payload
+  [key: string]: unknown;
 }
+
+/** Body returned by POST /api/stellar/donation/submit. */
+export interface DonationSubmitResult extends DonationApiEnvelope {
+  txHash?: string;
+  [key: string]: unknown;
+}
+
+/** Fields of a prepared donation that executeDonation consumes. */
+export type ExecuteDonationInput = Pick<
+  InitializeDonationResult,
+  "donationId" | "transactionXdr" | "networkPassphrase"
+>;
 
 export interface UseStellarDonationResult {
   initializeDonation: (params: InitializeDonationParams) => Promise<InitializeDonationResult | null>;
-  executeDonation: (donationData: any) => Promise<any>; // TODO(types): Donation submission payload
+  executeDonation: (donationData: ExecuteDonationInput | null) => Promise<DonationSubmitResult | false>;
   cancelDonation: () => void;
   getDonationStats: () => Promise<DonationStatsResult>;
   isProcessing: boolean;
   currentDonation: InitializeDonationResult | null;
+}
+
+/** Shape of an Axios-style error; every field is optional because thrown values vary. */
+interface RequestErrorShape {
+  response?: { status?: number; data?: { message?: string } };
+  message?: string;
+}
+
+function readErrorDetails(error: unknown): { status?: number; message?: string } {
+  if (typeof error !== "object" || error === null) return {};
+  const { response, message } = error as RequestErrorShape;
+  return { status: response?.status, message: response?.data?.message || message };
+}
+
+/** Minimal Sentry surface used here; the SDK is loaded lazily. */
+interface SentryScopeLike {
+  setTag(key: string, value: string): void;
+}
+
+interface SentryLike {
+  captureException(error: unknown): void;
+  withScope(callback: (scope: SentryScopeLike) => void): void;
+}
+
+function isSentryLike(value: unknown): value is SentryLike {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "captureException" in value &&
+    typeof value.captureException === "function" &&
+    "withScope" in value &&
+    typeof value.withScope === "function"
+  );
+}
+
+function resolveSentryModule(mod: unknown): unknown {
+  if (typeof mod === "object" && mod !== null && "default" in mod && mod.default != null) {
+    return mod.default;
+  }
+  return mod;
 }
 
 export const useStellarDonation = (): UseStellarDonationResult => {
@@ -48,7 +112,7 @@ export const useStellarDonation = (): UseStellarDonationResult => {
 
       setIsProcessing(true);
       try {
-        const res = await axiosInstance.post(
+        const res = await axiosInstance.post<InitializeDonationApiResponse>(
           "/api/stellar/donation/initialize",
           {
             amount,
@@ -63,9 +127,9 @@ export const useStellarDonation = (): UseStellarDonationResult => {
         } else {
           throw new Error(res.data.message);
         }
-      } catch (error: any) { // TODO(types): Error from donation init
-        const message = error.response?.data?.message || error.message;
-        if (error.response?.status === 503) {
+      } catch (error: unknown) {
+        const { status, message } = readErrorDetails(error);
+        if (status === 503) {
           toast.error("Donations are not available right now. Please try again later.");
         } else {
           toast.error(message);
@@ -79,7 +143,7 @@ export const useStellarDonation = (): UseStellarDonationResult => {
   );
 
   const executeDonation = useCallback(
-    async (donationData: any): Promise<any> => { // TODO(types): Donation data object
+    async (donationData: ExecuteDonationInput | null): Promise<DonationSubmitResult | false> => {
       if (!donationData) {
         toast.error("No donation data available");
         return false;
@@ -95,10 +159,13 @@ export const useStellarDonation = (): UseStellarDonationResult => {
           networkPassphrase
         );
 
-        const res = await axiosInstance.post("/api/stellar/donation/submit", {
-          donationId: donationData.donationId,
-          signedXdr,
-        });
+        const res = await axiosInstance.post<DonationSubmitResult>(
+          "/api/stellar/donation/submit",
+          {
+            donationId: donationData.donationId,
+            signedXdr,
+          }
+        );
 
         if (res.data.success) {
           toast.success("JazakAllahu khairan! Donation successful!");
@@ -110,19 +177,19 @@ export const useStellarDonation = (): UseStellarDonationResult => {
         } else {
           throw new Error(res.data.message);
         }
-      } catch (error: any) { // TODO(types): Donation execution error
+      } catch (error: unknown) {
         import("@sentry/nextjs")
-          .then((mod) => {
-            const Sentry = mod.default ?? mod;
-            if (!Sentry || typeof Sentry.captureException !== "function") return;
-            Sentry.withScope((scope: any) => { // TODO(types): Sentry scope
+          .then((mod: unknown) => {
+            const Sentry = resolveSentryModule(mod);
+            if (!isSentryLike(Sentry)) return;
+            Sentry.withScope((scope) => {
               scope.setTag("feature", "stellar-donation");
               Sentry.captureException(error);
             });
           })
           .catch(() => {});
 
-        const message = error.response?.data?.message || error.message;
+        const message = readErrorDetails(error).message ?? "";
 
         if (message.includes("insufficient") || message.includes("underfunded")) {
           toast.error("Insufficient USDC balance");
@@ -149,14 +216,15 @@ export const useStellarDonation = (): UseStellarDonationResult => {
 
   const getDonationStats = useCallback(async (): Promise<DonationStatsResult> => {
     try {
-      const res = await axiosInstance.get("/api/stellar/donation/stats");
+      const res = await axiosInstance.get<DonationStatsResult>("/api/stellar/donation/stats");
       return res.data;
-    } catch (error: any) { // TODO(types): Error from donation stats
+    } catch (error: unknown) {
       console.error("Failed to fetch donation stats:", error);
+      const { status, message } = readErrorDetails(error);
       return {
         success: false,
-        unconfigured: error.response?.status === 503,
-        message: error.response?.data?.message || error.message,
+        unconfigured: status === 503,
+        message,
       };
     }
   }, []);
